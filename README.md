@@ -1,31 +1,37 @@
 <p align="center">
-  <img src="https://visitor-badge.laobi.icu/badge?page_id=vadlike.proxmox-intel-vgpu-installer" alt="visitors">
-  </a>
-  <img src="https://img.shields.io/github/last-commit/vadlike/proxmox-intel-vgpu-installer" alt="last commit">
+  <img src="https://visitor-badge.laobi.icu/badge?page_id=vadlike.proxmox-helper-script" alt="visitors">
+  <img src="https://img.shields.io/github/last-commit/vadlike/proxmox-helper-script" alt="last commit">
   <img src="https://img.shields.io/badge/platform-Proxmox%20VE%208%2F9-E57000" alt="platform">
   <img src="https://img.shields.io/badge/license-MIT-16A34A" alt="license">
 </p>
 
-# Proxmox Intel Iris Xe SR-IOV vGPU Helper
+# Proxmox Helper Script
 
-Enable, validate, rollback Intel SR-IOV vGPU on Proxmox VE (GRUB hosts).
-
-`proxmox-disk-mount-helper.sh` for Proxmox VE:
-
-- host disk mount
-- LXC bind mount attach/remove
-- CLI GParted-style disk editor
+Mount disks on Proxmox host, attach bind mounts to LXC, and manage partitions with a CLI GParted-style workflow.
 
 Repository:
 
 - Main repo: `https://github.com/vadlike/proxmox-helper-script`
-- Reference example: `https://github.com/vadlike/proxmox-intel-vgpu-installer`
+- Reference repo: `https://github.com/vadlike/proxmox-intel-vgpu-installer`
 
 ## Screenshot
 
 <p align="center">
   <img src="./pic.png" alt="Proxmox Helper Script" width="70%">
 </p>
+
+## Features
+
+- Host mount (`temporary` or `persist in /etc/fstab`)
+- LXC bind attach/remove
+- Remove host and LXC mounts
+- Status report
+- Disk editor mode:
+  - inspect
+  - wipe signatures
+  - create/replace partition table
+  - create/delete/resize partition
+  - format filesystems
 
 ## Quick Install
 
