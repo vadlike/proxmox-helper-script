@@ -47,6 +47,7 @@ Commands:
   host-mount      Mount an existing disk on the Proxmox host
   lxc-attach      Bind a host path into an LXC container with pct set
   disk-editor     CLI GParted-style disk editor using native Proxmox tools
+  mirror-folder   Built-in mirror folder helper (single-file mode)
   status          Show current managed mounts and LXC bind mappings
   remove-mount    Remove a managed or other non-system host mount
   remove-lxc      Remove a managed LXC bind mount (user-friendly alias)
@@ -413,20 +414,248 @@ prompt_browse_host_directory_selection() {
   done
 }
 
+device_parent_disk() {
+  local path="$1"
+  local type="$2"
+  local pkname="$3"
+
+  if [[ "$type" == "disk" ]]; then
+    printf '%s' "$path"
+    return
+  fi
+  if [[ -n "$pkname" && "$pkname" != "-" ]]; then
+    printf '/dev/%s' "$pkname"
+    return
+  fi
+  lsblk -ndo PKNAME "$path" 2>/dev/null | head -n1 | awk '{ if ($1 != "") print "/dev/" $1 }'
+}
+
+device_type_label() {
+  local path="$1"
+  local type="$2"
+  local parent_disk="$3"
+  local tran rota
+
+  if [[ "$type" == "part" ]]; then
+    printf '%s' "partition"
+    return
+  fi
+
+  tran="$(lsblk -ndo TRAN "$path" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+  rota="$(lsblk -ndo ROTA "$path" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+  case "$tran" in
+    nvme) printf '%s' "nvme" ;;
+    usb) printf '%s' "USB" ;;
+    sata|ata)
+      if [[ "$rota" == "0" ]]; then
+        printf '%s' "SSD"
+      else
+        printf '%s' "HDD"
+      fi
+      ;;
+    *)
+      if [[ "$rota" == "0" ]]; then
+        printf '%s' "SSD"
+      elif [[ "$rota" == "1" ]]; then
+        printf '%s' "HDD"
+      elif [[ "$type" == "disk" ]]; then
+        printf '%s' "disk"
+      else
+        printf '%s' "${type:-unknown}"
+      fi
+      ;;
+  esac
+}
+
+device_usage_label() {
+  local type="$1"
+  local fstype="$2"
+  local mountpoint="$3"
+  local parttype="$4"
+
+  if [[ "$type" == "disk" ]]; then
+    printf '%s' "partitions"
+    return
+  fi
+  if [[ "$mountpoint" == "[SWAP]" || "$fstype" == "swap" ]]; then
+    printf '%s' "swap"
+    return
+  fi
+
+  case "${parttype,,}" in
+    c12a7328-f81f-11d2-ba4b-00a0c93ec93b) printf '%s' "EFI" ; return ;;
+    21686148-6449-6e6f-744e-656564454649) printf '%s' "BIOS boot" ; return ;;
+    e6d6d379-f507-44c2-a23c-238f2a3df928) printf '%s' "LVM" ; return ;;
+  esac
+
+  case "$fstype" in
+    LVM2_member) printf '%s' "LVM" ;;
+    vfat) printf '%s' "EFI" ;;
+    ""|-) printf '%s' "No" ;;
+    *) printf '%s' "$fstype" ;;
+  esac
+}
+
+device_gpt_label() {
+  local disk="$1"
+  local pttype=""
+
+  pttype="$(lsblk -ndo PTTYPE "$disk" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+  if [[ "${pttype,,}" == "gpt" ]]; then
+    printf '%s' "Yes"
+  else
+    printf '%s' "No"
+  fi
+}
+
+device_model_label() {
+  local disk="$1"
+  local model=""
+
+  model="$(lsblk -ndo MODEL "$disk" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+  [[ -n "$model" ]] || model="--"
+  printf '%s' "$model"
+}
+
+device_model_for_path() {
+  local path="$1"
+  local type pkname parent_disk model
+
+  type="$(lsblk -ndo TYPE "$path" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+  pkname="$(lsblk -ndo PKNAME "$path" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+  parent_disk="$(device_parent_disk "$path" "$type" "$pkname")"
+  [[ -n "$parent_disk" ]] || parent_disk="$path"
+  model="$(device_model_label "$parent_disk")"
+  printf '%s' "$model"
+}
+
+truncate_field() {
+  local value="$1"
+  local max_len="$2"
+  local len=0
+  local keep=0
+
+  [[ -n "$value" ]] || { printf '%s' ""; return; }
+  len="${#value}"
+  if (( len <= max_len )); then
+    printf '%s' "$value"
+    return
+  fi
+  if (( max_len <= 3 )); then
+    printf '%s' "${value:0:max_len}"
+    return
+  fi
+  keep=$((max_len - 3))
+  printf '%s...' "${value:0:keep}"
+}
+
+lsblk_pair_value() {
+  local line="$1"
+  local key="$2"
+  local value
+
+  value="$(printf '%s\n' "$line" | sed -n "s/.*${key}=\"\\([^\"]*\\)\".*/\\1/p")"
+  printf '%s' "$value"
+}
+
 prompt_device_selection() {
   local options=()
-  local path size fstype uuid mountpoint desc
+  local selected_paths=()
+  local disk_path part_path
+  local parttype fstype mountpoint size
+  local type_label usage_label gpt_label model_label
+  local desc display_path idx tag
+  local part_count part_idx branch
+  local -a disk_paths=()
+  local -a part_paths=()
+  local prompt_text value="" rc=0
+  local menu_h=24 menu_w=180 list_h=14 term_cols term_lines
 
-  while read -r path size fstype uuid mountpoint; do
-    [[ -n "$fstype" ]] || continue
-    mountpoint="${mountpoint:--}"
-    uuid="${uuid:--}"
-    desc="size=${size} fs=${fstype} uuid=${uuid} mount=${mountpoint}"
-    options+=("$path" "$desc")
-  done < <(lsblk -nrpo PATH,SIZE,FSTYPE,UUID,MOUNTPOINT -e 7,11)
+  mapfile -t disk_paths < <(lsblk -dnpo PATH,TYPE -e 7,11 2>/dev/null | awk '$2=="disk" {print $1}')
+  [[ "${#disk_paths[@]}" -gt 0 ]] || die "$EXIT_VALIDATION" "No block devices available for mounting."
 
-  [[ "${#options[@]}" -gt 0 ]] || die "$EXIT_VALIDATION" "No formatted block devices available for mounting."
-  whiptail_menu_select "Host Mount" "Select source block device" "${options[@]}"
+  for disk_path in "${disk_paths[@]}"; do
+    size="$(lsblk -ndo SIZE "$disk_path" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+    [[ -n "$size" ]] || size="--"
+    type_label="$(device_type_label "$disk_path" "disk" "$disk_path")"
+    usage_label="partitions"
+    gpt_label="$(device_gpt_label "$disk_path")"
+    model_label="$(device_model_label "$disk_path")"
+    display_path="$disk_path"
+    display_path="$(truncate_field "$display_path" 24)"
+    model_label="$(truncate_field "$model_label" 30)"
+    desc="$(printf '%-24s %-10s %-12s %-8s %-3s %s' "$display_path" "$type_label" "$usage_label" "$size" "$gpt_label" "$model_label")"
+    idx="${#selected_paths[@]}"
+    tag="$((idx + 1))"
+    options+=("$tag" "$desc")
+    selected_paths+=("$disk_path")
+
+    mapfile -t part_paths < <(lsblk -nrpo PATH,TYPE "$disk_path" 2>/dev/null | awk '$2=="part" {print $1}')
+    part_count="${#part_paths[@]}"
+    if (( part_count == 0 )); then
+      continue
+    fi
+
+    for ((part_idx=0; part_idx<part_count; part_idx++)); do
+      part_path="${part_paths[$part_idx]}"
+      if (( part_idx == part_count - 1 )); then
+        branch="└─"
+      else
+        branch="├─"
+      fi
+
+      size="$(lsblk -ndo SIZE "$part_path" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+      [[ -n "$size" ]] || size="--"
+      fstype="$(lsblk -ndo FSTYPE "$part_path" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+      parttype="$(lsblk -ndo PARTTYPE "$part_path" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+      mountpoint="$(lsblk -ndo MOUNTPOINT "$part_path" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+      mountpoint="${mountpoint:--}"
+
+      type_label="partition"
+      usage_label="$(device_usage_label "part" "$fstype" "$mountpoint" "$parttype")"
+      gpt_label="$(device_gpt_label "$disk_path")"
+      model_label="$(device_model_label "$disk_path")"
+      display_path="  ${branch}${part_path}"
+      display_path="$(truncate_field "$display_path" 24)"
+      model_label="$(truncate_field "$model_label" 30)"
+      desc="$(printf '%-24s %-10s %-12s %-8s %-3s %s' "$display_path" "$type_label" "$usage_label" "$size" "$gpt_label" "$model_label")"
+      idx="${#selected_paths[@]}"
+      tag="$((idx + 1))"
+      options+=("$tag" "$desc")
+      selected_paths+=("$part_path")
+    done
+  done
+
+  [[ "${#options[@]}" -gt 0 ]] || die "$EXIT_VALIDATION" "No block devices available for mounting."
+
+  prompt_text="Select source block device\nDevice                    Type       Usage        Size     GPT Model"
+  term_cols="$(tput cols 2>/dev/null || echo 120)"
+  term_lines="$(tput lines 2>/dev/null || echo 30)"
+  if (( menu_w > term_cols - 4 )); then menu_w=$((term_cols - 4)); fi
+  if (( menu_w < 120 )); then menu_w=120; fi
+  if (( menu_h > term_lines - 2 )); then menu_h=$((term_lines - 2)); fi
+  if (( menu_h < 20 )); then menu_h=20; fi
+
+  if (( list_h > ${#selected_paths[@]} )); then
+    list_h="${#selected_paths[@]}"
+  fi
+  if (( list_h < 8 )); then list_h=8; fi
+
+  value="$(whiptail --title "Host Mount" --menu "$prompt_text" "$menu_h" "$menu_w" "$list_h" "${options[@]}" 3>&1 1>&2 2>&3)" || rc=$?
+  case "$rc" in
+    0)
+      if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        die "$EXIT_VALIDATION" "Invalid selection value: $value"
+      fi
+      idx="$((value - 1))"
+      if (( idx < 0 || idx >= ${#selected_paths[@]} )); then
+        die "$EXIT_VALIDATION" "Selection out of range: $value"
+      fi
+      printf '%s' "${selected_paths[$idx]}"
+      ;;
+    1|255) printf '%s' "$MENU_BACK_TOKEN" ;;
+    *) die "$EXIT_CANCELLED" "Operation cancelled." ;;
+  esac
 }
 
 prompt_ctid_selection() {
@@ -453,15 +682,27 @@ prompt_ctid_selection() {
 
 prompt_host_rollback_record() {
   local options=()
-  local idx=1 line uuid device mount_path persist fs_type
+  local idx=1 uuid device mount_path persist fs_type desc model
+  local value="" rc=0 menu_h=22 menu_w=170 list_h=12
 
   while IFS='|' read -r uuid device mount_path persist fs_type; do
     [[ -n "$uuid" ]] || continue
-    options+=("$idx" "mount=${mount_path} uuid=${uuid} persist=${persist} fs=${fs_type}")
+    model="$(device_model_for_path "${device:---}")"
+    desc="$(printf '%-17s %-18s %-30s %-6s %-8s %s' "$(truncate_field "${device:---}" 17)" "$(truncate_field "${model:---}" 18)" "$(truncate_field "${mount_path:---}" 30)" "${fs_type:---}" "${persist:---}" "$(truncate_field "${uuid:---}" 12)")"
+    options+=("$idx" "$desc")
     idx=$((idx + 1))
   done <"$HOST_STATE_FILE"
 
   [[ "${#options[@]}" -gt 0 ]] || die "$EXIT_VALIDATION" "No managed host mounts found in state."
+  if use_whiptail_ui; then
+    value="$(whiptail --title "Rollback Host" --menu "Select host mount to remove\nDevice            Model              Mount path                     FS     Persist  UUID" "$menu_h" "$menu_w" "$list_h" "${options[@]}" 3>&1 1>&2 2>&3)" || rc=$?
+    case "$rc" in
+      0) printf '%s' "$value" ;;
+      1|255) printf '%s' "$MENU_BACK_TOKEN" ;;
+      *) die "$EXIT_CANCELLED" "Operation cancelled." ;;
+    esac
+    return 0
+  fi
   printf '%s' "$(whiptail_menu_select "Rollback Host" "Select host mount to remove" "${options[@]}")"
 }
 
@@ -490,15 +731,27 @@ list_non_system_host_mounts() {
 
 prompt_any_host_mount_record() {
   local options=()
-  local idx=1 uuid device mount_path fs_type
+  local idx=1 uuid device mount_path fs_type desc model
+  local value="" rc=0 menu_h=22 menu_w=170 list_h=12
 
   while IFS='|' read -r uuid device mount_path fs_type; do
     [[ -n "$mount_path" ]] || continue
-    options+=("$idx" "mount=${mount_path} device=${device} uuid=${uuid:--} fs=${fs_type:--}")
+    model="$(device_model_for_path "${device:---}")"
+    desc="$(printf '%-17s %-18s %-30s %-6s %s' "$(truncate_field "${device:---}" 17)" "$(truncate_field "${model:---}" 18)" "$(truncate_field "${mount_path:---}" 30)" "${fs_type:---}" "$(truncate_field "${uuid:---}" 12)")"
+    options+=("$idx" "$desc")
     idx=$((idx + 1))
   done < <(list_non_system_host_mounts)
 
   [[ "${#options[@]}" -gt 0 ]] || die "$EXIT_VALIDATION" "No removable non-system mounted disks found."
+  if use_whiptail_ui; then
+    value="$(whiptail --title "Remove Host Mount" --menu "Select mounted disk to remove\nDevice            Model              Mount path                     FS     UUID" "$menu_h" "$menu_w" "$list_h" "${options[@]}" 3>&1 1>&2 2>&3)" || rc=$?
+    case "$rc" in
+      0) printf '%s' "$value" ;;
+      1|255) printf '%s' "$MENU_BACK_TOKEN" ;;
+      *) die "$EXIT_CANCELLED" "Operation cancelled." ;;
+    esac
+    return 0
+  fi
   printf '%s' "$(whiptail_menu_select "Remove Host Mount" "Select mounted disk to remove" "${options[@]}")"
 }
 
@@ -815,23 +1068,93 @@ disk_inspection_report() {
 
 prompt_disk_editor_disk_selection() {
   local options=()
+  local selected_paths=()
   local disks=()
-  local disk size model risk desc
-  local choice selected
+  local parts=()
+  local disk part size model risk desc type_label usage_label gpt_label display_path
+  local fstype parttype mountpoint
+  local choice selected idx tag rc=0 value=""
+  local menu_h=24 menu_w=180 list_h=14 term_cols term_lines
+  local part_count part_idx branch part_disk
 
-  while read -r disk; do
+  mapfile -t disks < <(list_disk_devices)
+  for disk in "${disks[@]}"; do
     [[ -n "$disk" ]] || continue
-    disks+=("$disk")
     size="$(disk_size "$disk")"
     model="$(disk_model "$disk")"
+    [[ -n "$size" ]] || size="--"
+    [[ -n "$model" ]] || model="--"
     risk="$(device_risk_flags "$disk")"
-    desc="size=${size:--} model=${model:--} risk=${risk}"
-    options+=("$disk" "$desc")
-  done < <(list_disk_devices)
+    type_label="$(device_type_label "$disk" "disk" "$disk")"
+    usage_label="partitions"
+    gpt_label="$(device_gpt_label "$disk")"
+    display_path="$(truncate_field "$disk" 24)"
+    model="$(truncate_field "$model" 26)"
+    desc="$(printf '%-24s %-10s %-12s %-8s %-3s %-26s %s' "$display_path" "$type_label" "$usage_label" "$size" "$gpt_label" "$model" "$risk")"
+    idx="${#selected_paths[@]}"
+    tag="$((idx + 1))"
+    options+=("$tag" "$desc")
+    selected_paths+=("$disk")
+
+    mapfile -t parts < <(disk_partitions_list "$disk")
+    part_count="${#parts[@]}"
+    for ((part_idx=0; part_idx<part_count; part_idx++)); do
+      part="${parts[$part_idx]}"
+      [[ -n "$part" ]] || continue
+      if (( part_idx == part_count - 1 )); then
+        branch="└─"
+      else
+        branch="├─"
+      fi
+      size="$(lsblk -ndo SIZE "$part" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+      fstype="$(lsblk -ndo FSTYPE "$part" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+      parttype="$(lsblk -ndo PARTTYPE "$part" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+      mountpoint="$(lsblk -ndo MOUNTPOINT "$part" 2>/dev/null | head -n1 | awk '{$1=$1; print}')"
+      mountpoint="${mountpoint:--}"
+      usage_label="$(device_usage_label "part" "$fstype" "$mountpoint" "$parttype")"
+      type_label="partition"
+      gpt_label="$(device_gpt_label "$disk")"
+      model="$(truncate_field "$(device_model_label "$disk")" 26)"
+      display_path="$(truncate_field "  ${branch}${part}" 24)"
+      desc="$(printf '%-24s %-10s %-12s %-8s %-3s %-26s %s' "$display_path" "$type_label" "$usage_label" "${size:---}" "$gpt_label" "$model" "$risk")"
+      idx="${#selected_paths[@]}"
+      tag="$((idx + 1))"
+      options+=("$tag" "$desc")
+      selected_paths+=("$part")
+    done
+  done
 
   [[ "${#options[@]}" -gt 0 ]] || die "$EXIT_VALIDATION" "No disk devices found."
   if use_whiptail_ui; then
-    whiptail_menu_select "GParted Mode" "Select disk to inspect or edit" "${options[@]}"
+    term_cols="$(tput cols 2>/dev/null || echo 120)"
+    term_lines="$(tput lines 2>/dev/null || echo 30)"
+    if (( menu_w > term_cols - 4 )); then menu_w=$((term_cols - 4)); fi
+    if (( menu_w < 120 )); then menu_w=120; fi
+    if (( menu_h > term_lines - 2 )); then menu_h=$((term_lines - 2)); fi
+    if (( menu_h < 20 )); then menu_h=20; fi
+    if (( list_h > ${#selected_paths[@]} )); then list_h="${#selected_paths[@]}"; fi
+    if (( list_h < 8 )); then list_h=8; fi
+
+    value="$(whiptail --title "GParted Mode" --menu "Select disk to inspect or edit\nDevice                    Type       Usage        Size     GPT Model                      Risk" "$menu_h" "$menu_w" "$list_h" "${options[@]}" 3>&1 1>&2 2>&3)" || rc=$?
+    case "$rc" in
+      0)
+        if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+          die "$EXIT_VALIDATION" "Invalid selection value: $value"
+        fi
+        idx="$((value - 1))"
+        if (( idx < 0 || idx >= ${#selected_paths[@]} )); then
+          die "$EXIT_VALIDATION" "Selection out of range: $value"
+        fi
+        selected="${selected_paths[$idx]}"
+        if [[ "$(lsblk -ndo TYPE "$selected" 2>/dev/null | head -n1 | awk '{$1=$1; print}')" == "part" ]]; then
+          part_disk="$(base_disk_for_path "$selected")"
+          [[ -n "$part_disk" ]] && selected="$part_disk"
+        fi
+        printf '%s' "$selected"
+        ;;
+      1|255) printf '%s' "$MENU_BACK_TOKEN" ;;
+      *) die "$EXIT_CANCELLED" "Operation cancelled." ;;
+    esac
     return 0
   fi
 
@@ -902,7 +1225,9 @@ prompt_partition_selection_for_disk() {
   local options=()
   local parts=()
   local part fs label uuid mount desc
-  local choice selected
+  local choice selected idx tag rc=0 value=""
+  local menu_h=24 menu_w=180 list_h=12 term_cols term_lines
+  local part_count part_idx branch display_path
 
   while read -r part; do
     [[ -n "$part" ]] || continue
@@ -917,7 +1242,50 @@ prompt_partition_selection_for_disk() {
 
   [[ "${#options[@]}" -gt 0 ]] || die "$EXIT_VALIDATION" "No partitions found on $disk."
   if use_whiptail_ui; then
-    whiptail_menu_select "$title" "$prompt" "${options[@]}"
+    options=()
+    part_count="${#parts[@]}"
+    for ((part_idx=0; part_idx<part_count; part_idx++)); do
+      part="${parts[$part_idx]}"
+      fs="$(blkid -s TYPE -o value "$part" 2>/dev/null || true)"
+      label="$(blkid -s LABEL -o value "$part" 2>/dev/null || true)"
+      uuid="$(blkid -s UUID -o value "$part" 2>/dev/null || true)"
+      mount="$(findmnt -rn -o TARGET --source "$part" 2>/dev/null || true)"
+      if (( part_idx == part_count - 1 )); then
+        branch="└─"
+      else
+        branch="├─"
+      fi
+      display_path="$(truncate_field "  ${branch}${part}" 28)"
+      desc="$(printf '%-28s %-8s %-16s %-28s %s' "$display_path" "${fs:---}" "$(truncate_field "${label:---}" 16)" "$(truncate_field "${mount:---}" 28)" "$(truncate_field "${uuid:---}" 24)")"
+      idx="${#options[@]}"
+      tag="$((idx / 2 + 1))"
+      options+=("$tag" "$desc")
+    done
+
+    term_cols="$(tput cols 2>/dev/null || echo 120)"
+    term_lines="$(tput lines 2>/dev/null || echo 30)"
+    if (( menu_w > term_cols - 4 )); then menu_w=$((term_cols - 4)); fi
+    if (( menu_w < 120 )); then menu_w=120; fi
+    if (( menu_h > term_lines - 2 )); then menu_h=$((term_lines - 2)); fi
+    if (( menu_h < 20 )); then menu_h=20; fi
+    if (( list_h > part_count )); then list_h="$part_count"; fi
+    if (( list_h < 8 )); then list_h=8; fi
+
+    value="$(whiptail --title "$title" --menu "$prompt\nPartition                  FS       Label            Mount path                   UUID\nDisk: $disk" "$menu_h" "$menu_w" "$list_h" "${options[@]}" 3>&1 1>&2 2>&3)" || rc=$?
+    case "$rc" in
+      0)
+        if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+          die "$EXIT_VALIDATION" "Invalid selection value: $value"
+        fi
+        idx="$((value - 1))"
+        if (( idx < 0 || idx >= part_count )); then
+          die "$EXIT_VALIDATION" "Selection out of range: $value"
+        fi
+        printf '%s' "${parts[$idx]}"
+        ;;
+      1|255) printf '%s' "$MENU_BACK_TOKEN" ;;
+      *) die "$EXIT_CANCELLED" "Operation cancelled." ;;
+    esac
     return 0
   fi
 
@@ -1516,7 +1884,7 @@ run_disk_editor() {
 
 list_disk_summary() {
   info "Available block devices:"
-  lsblk -o NAME,PATH,SIZE,FSTYPE,UUID,MOUNTPOINT -e 7,11
+  lsblk -o NAME,PATH,TYPE,SIZE,FSTYPE,PTTYPE,MODEL,UUID,MOUNTPOINT -e 7,11
 }
 
 resolve_device_from_uuid() {
@@ -1536,7 +1904,18 @@ resolve_fstype_from_device() {
 
 find_existing_mount_source() {
   local target="$1"
-  findmnt -rn -o SOURCE --target "$target" 2>/dev/null || true
+  local row mnt src
+  row="$(findmnt -rn -o TARGET,SOURCE --target "$target" 2>/dev/null | head -n1 || true)"
+  mnt="$(awk '{print $1}' <<<"$row" 2>/dev/null || true)"
+  src="$(awk '{print $2}' <<<"$row" 2>/dev/null || true)"
+  if [[ "$mnt" == "$target" ]]; then
+    printf '%s' "$src"
+  fi
+}
+
+is_path_mounted() {
+  local target="$1"
+  [[ -n "$(find_existing_mount_source "$target")" ]]
 }
 
 find_existing_mount_uuid() {
@@ -1629,6 +2008,107 @@ remove_fstab_entry() {
 
   mv "$tmp" /etc/fstab
   info "Removed matching /etc/fstab entry."
+}
+
+remove_fstab_entry_for_mount_path() {
+  local mount_path="$1"
+  local tmp removed=0
+
+  [[ -f /etc/fstab ]] || return 0
+  backup_file /etc/fstab
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    info "DRY-RUN: remove /etc/fstab entry for mount_path=$mount_path"
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+  awk -v mount_path="$mount_path" '
+    BEGIN { removed = 0 }
+    /^[[:space:]]*#/ { print; next }
+    {
+      opts = $4
+      is_bind = (opts ~ /(^|,)bind(,|$)/)
+      if ($2 == mount_path && !is_bind) {
+        removed = 1
+        next
+      }
+      print
+    }
+    END {
+      if (removed == 0) exit 2
+    }
+  ' /etc/fstab >"$tmp" || removed=$?
+
+  if [[ "$removed" -eq 2 ]]; then
+    rm -f "$tmp"
+    info "No matching non-bind /etc/fstab entry found for mount_path=$mount_path."
+    return 0
+  fi
+
+  mv "$tmp" /etc/fstab
+  info "Removed matching non-bind /etc/fstab entry for mount_path=$mount_path."
+}
+
+remove_fstab_bind_entries_for_path() {
+  local mount_path="$1"
+  local tmp removed=0
+
+  [[ -f /etc/fstab ]] || return 0
+  backup_file /etc/fstab
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    info "DRY-RUN: remove bind entries in /etc/fstab related to $mount_path"
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+  awk -v p="$mount_path" '
+    BEGIN { removed = 0 }
+    /^[[:space:]]*#/ { print; next }
+    {
+      opts = $4
+      is_bind = (opts ~ /(^|,)bind(,|$)/)
+      src_match = ($1 == p || index($1, p "/") == 1)
+      dst_match = ($2 == p || index($2, p "/") == 1)
+      if (is_bind && (src_match || dst_match)) {
+        removed = 1
+        next
+      }
+      print
+    }
+    END { if (removed == 0) exit 2 }
+  ' /etc/fstab >"$tmp" || removed=$?
+
+  if [[ "$removed" -eq 2 ]]; then
+    rm -f "$tmp"
+    info "No related bind entries found in /etc/fstab for $mount_path."
+    return 0
+  fi
+
+  mv "$tmp" /etc/fstab
+  info "Removed related bind entries from /etc/fstab for $mount_path."
+}
+
+unmount_bind_children_for_path() {
+  local mount_path="$1"
+  local target
+  local had_children=0
+
+  while read -r target; do
+    [[ -n "$target" ]] || continue
+    had_children=1
+    run_cmd "umount '$target'" || true
+  done < <(
+    findmnt -rn -o SOURCE,TARGET 2>/dev/null | \
+      awk -v p="$mount_path" '$1 == p || index($1, p "/") == 1 { print $2 }' | \
+      awk -v p="$mount_path" '$1 != p' | \
+      sort -r
+  )
+
+  if [[ "$had_children" -eq 1 ]]; then
+    info "Processed dependent bind mounts for $mount_path."
+  fi
 }
 
 prompt_mount_persistence() {
@@ -2203,7 +2683,8 @@ select_lxc_state_record() {
 }
 
 run_rollback_host() {
-  local record fs_type mounted_src remove_mode state_record_found=0
+  local record fs_type="" mounted_src remove_mode state_record_found=0
+  local fstab_line fstab_src
 
   require_root
   require_proxmox
@@ -2214,23 +2695,41 @@ run_rollback_host() {
     if [[ -n "$MOUNT_PATH" && -z "$UUID_VALUE" ]]; then
       MOUNT_PATH="$(normalize_path "$MOUNT_PATH")"
       mounted_src="$(find_existing_mount_source "$MOUNT_PATH")"
-      [[ -n "$mounted_src" ]] || die "$EXIT_VALIDATION" "Mount path is not currently mounted: $MOUNT_PATH"
-      DEVICE="$mounted_src"
-      if [[ "$DEVICE" =~ ^UUID= ]]; then
-        UUID_VALUE="${DEVICE#UUID=}"
+      if [[ -n "$mounted_src" ]]; then
+        DEVICE="$mounted_src"
+        if [[ "$DEVICE" =~ ^UUID= ]]; then
+          UUID_VALUE="${DEVICE#UUID=}"
+        else
+          UUID_VALUE="$(resolve_uuid_from_device "$DEVICE")"
+        fi
+        fs_type="$(resolve_fstype_from_device "$DEVICE")"
       else
-        UUID_VALUE="$(resolve_uuid_from_device "$DEVICE")"
+        info "Mount path is not currently mounted: $MOUNT_PATH (cleanup mode)."
       fi
-      fs_type="$(resolve_fstype_from_device "$DEVICE")"
       if [[ -f "$HOST_STATE_FILE" && -s "$HOST_STATE_FILE" ]]; then
         while IFS='|' read -r state_uuid state_device state_mount state_persist state_fs; do
           if [[ "$state_mount" == "$MOUNT_PATH" ]]; then
             PERSIST_MODE="$state_persist"
+            [[ -z "$DEVICE" ]] && DEVICE="$state_device"
+            [[ -z "$UUID_VALUE" ]] && UUID_VALUE="$state_uuid"
+            [[ -z "$fs_type" ]] && fs_type="$state_fs"
             record="${state_uuid}|${state_device}|${state_mount}|${state_persist}|${state_fs}"
             state_record_found=1
             break
           fi
         done <"$HOST_STATE_FILE"
+      fi
+      if [[ -z "$UUID_VALUE" ]]; then
+        fstab_line="$(fstab_find_entry_for_mount "$MOUNT_PATH" | head -n1)"
+        if [[ -n "$fstab_line" ]]; then
+          fstab_src="$(awk '{print $1}' <<<"$fstab_line")"
+          if [[ "$fstab_src" =~ ^UUID= ]]; then
+            UUID_VALUE="${fstab_src#UUID=}"
+          elif [[ "$fstab_src" == /dev/* ]]; then
+            DEVICE="$fstab_src"
+            UUID_VALUE="$(resolve_uuid_from_device "$DEVICE")"
+          fi
+        fi
       fi
     else
       fs_type=""
@@ -2292,9 +2791,16 @@ run_rollback_host() {
     prompt_yes_no "Remove host mount $MOUNT_PATH${UUID_VALUE:+ (UUID=$UUID_VALUE)}?" "n" || die "$EXIT_CANCELLED" "Rollback cancelled."
   fi
 
-  mounted_src="$(find_existing_mount_source "$MOUNT_PATH")"
-  if [[ -n "$mounted_src" ]]; then
-    run_cmd "umount '$MOUNT_PATH'"
+  unmount_bind_children_for_path "$MOUNT_PATH"
+  if is_path_mounted "$MOUNT_PATH"; then
+    run_cmd "umount '$MOUNT_PATH'" || true
+    if is_path_mounted "$MOUNT_PATH"; then
+      warn "Normal unmount failed for $MOUNT_PATH; trying lazy unmount."
+      run_cmd "umount -l '$MOUNT_PATH'" || true
+    fi
+    if is_path_mounted "$MOUNT_PATH"; then
+      die "$EXIT_VALIDATION" "Unable to unmount $MOUNT_PATH"
+    fi
   else
     info "Mount path is not currently mounted: $MOUNT_PATH"
   fi
@@ -2302,8 +2808,9 @@ run_rollback_host() {
   if [[ -n "$UUID_VALUE" ]]; then
     remove_fstab_entry "$UUID_VALUE" "$MOUNT_PATH"
   else
-    info "No UUID detected for $MOUNT_PATH; skipping /etc/fstab cleanup."
+    remove_fstab_entry_for_mount_path "$MOUNT_PATH"
   fi
+  remove_fstab_bind_entries_for_path "$MOUNT_PATH"
   if [[ $state_record_found -eq 1 && -n "${record:-}" ]]; then
     state_remove_line "$HOST_STATE_FILE" "$record"
   fi
@@ -2404,6 +2911,434 @@ EOF
   done
 }
 
+MIRROR_TITLE="Mirror Folder Manager"
+MIRROR_FSTAB="/etc/fstab"
+MIRROR_START_SRC="/mnt"
+MIRROR_START_DST="/mnt"
+MIRROR_TRY_UMOUNT_NOTE=""
+
+mirror_require_tools() {
+  require_root
+  require_proxmox
+  require_commands whiptail findmnt awk sed sort dirname basename mount umount grep
+}
+
+mirror_escape_sed() {
+  echo "$1" | sed 's/[.[\*^$()+?{|]/\\&/g'
+}
+
+mirror_is_mounted() {
+  # Exact mountpoint check (not parent filesystem).
+  local target="$1"
+  awk -v t="$target" '
+    $5 == t { found=1; exit 0 }
+    END { exit(found ? 0 : 1) }
+  ' /proc/self/mountinfo
+}
+
+mirror_get_mount_source() {
+  # Return exact mountpoint source from mountinfo.
+  local target="$1"
+  awk -v t="$target" '
+    $5 == t {
+      split($0, a, " - ");
+      split(a[2], b, " ");
+      print b[2];
+      exit
+    }
+  ' /proc/self/mountinfo
+}
+
+mirror_active_relevant_mounts() {
+  # Output: "<source>|<target>|BIND>"
+  # Only real bind/rbind mounts are mirrors.
+  findmnt -rn -o SOURCE,TARGET,OPTIONS 2>/dev/null | \
+    awk '
+      {
+        src=$1; tgt=$2; opts=$3;
+        is_bind = (opts ~ /(^|,)bind(,|$)/ || opts ~ /(^|,)rbind(,|$)/);
+        if (is_bind) {
+          print src "|" tgt "|BIND";
+        }
+      }'
+}
+
+mirror_fstab_bind_mounts() {
+  # Output: "<source> <target>"
+  awk '
+    /^[[:space:]]*#/ {next}
+    NF < 4 {next}
+    {
+      if ($3 == "none" && $4 ~ /(^|,)bind(,|$)/) {
+        print $1 " " $2;
+      }
+    }
+  ' "$MIRROR_FSTAB"
+}
+
+mirror_add_fstab_bind() {
+  local src="$1" dst="$2"
+  local src_re dst_re
+  src_re="$(mirror_escape_sed "$src")"
+  dst_re="$(mirror_escape_sed "$dst")"
+
+  if grep -E "^[[:space:]]*${src_re}[[:space:]]+${dst_re}[[:space:]]+none[[:space:]]+.*bind" "$MIRROR_FSTAB" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  cp "$MIRROR_FSTAB" "${MIRROR_FSTAB}.bak.$(date +%F-%H%M%S)"
+  printf '%s %s none bind,nofail 0 0\n' "$src" "$dst" >>"$MIRROR_FSTAB"
+}
+
+mirror_remove_fstab_bind_by_target() {
+  local dst="$1"
+  local tmp
+  tmp="$(mktemp)"
+
+  cp "$MIRROR_FSTAB" "${MIRROR_FSTAB}.bak.$(date +%F-%H%M%S)"
+  awk -v d="$dst" '
+    /^[[:space:]]*#/ {print; next}
+    NF < 4 {print; next}
+    {
+      if ($2 == d && $3 == "none" && $4 ~ /(^|,)bind(,|$)/) next
+      print
+    }
+  ' "$MIRROR_FSTAB" >"$tmp"
+  cat "$tmp" >"$MIRROR_FSTAB"
+  rm -f "$tmp"
+}
+
+mirror_try_unmount_target() {
+  local dst="$1"
+  local err
+  MIRROR_TRY_UMOUNT_NOTE=""
+
+  # 1) normal unmount
+  if umount "$dst" 2>/tmp/mirror_umount_err.$$; then
+    rm -f /tmp/mirror_umount_err.$$
+    return 0
+  fi
+
+  err="$(cat /tmp/mirror_umount_err.$$ 2>/dev/null || true)"
+  rm -f /tmp/mirror_umount_err.$$
+
+  # Already unmounted between list refresh and action: treat as success.
+  if echo "$err" | grep -qi "not mounted"; then
+    MIRROR_TRY_UMOUNT_NOTE="Target is already not mounted."
+    return 0
+  fi
+
+  # 2) recursive unmount for nested mounts
+  if umount -R "$dst" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # 3) lazy fallback if busy
+  if whiptail --title "$MIRROR_TITLE" --yesno \
+    "Normal unmount failed:\n$err\n\nTry lazy unmount (umount -l)?" \
+    14 90; then
+    if umount -l "$dst" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+mirror_browse_folder() {
+  local current="$1"
+  local choice
+
+  [[ -z "$current" || "$current" != /* ]] && current="/"
+  [[ ! -d "$current" ]] && current="/"
+
+  while true; do
+    local options=()
+    options+=("SELECT" "[Use this folder] $current")
+    [[ "$current" != "/" ]] && options+=("UP" "../")
+
+    local children=()
+    while IFS= read -r -d '' d; do
+      children+=("$d")
+    done < <(find "$current" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -z)
+
+    for d in "${children[@]}"; do
+      options+=("$d" "$(basename "$d")/")
+    done
+
+    choice="$(whiptail --title "$MIRROR_TITLE - Folder Browser" --menu \
+      "Arrows: navigate | Enter: open | SELECT: choose current folder\n\nCurrent: $current" \
+      24 100 14 \
+      "${options[@]}" \
+      3>&1 1>&2 2>&3)" || return "$EXIT_CANCELLED"
+
+    case "$choice" in
+      SELECT)
+        echo "$current"
+        return 0
+        ;;
+      UP)
+        current="$(dirname "$current")"
+        [[ -z "$current" ]] && current="/"
+        ;;
+      *)
+        if [[ -d "$choice" ]]; then
+          current="$choice"
+        fi
+        ;;
+    esac
+  done
+}
+
+mirror_create_wizard() {
+  local src dst existing_src
+
+  src="$(mirror_browse_folder "$MIRROR_START_SRC")" || return 0
+  dst="$(mirror_browse_folder "$MIRROR_START_DST")" || return 0
+
+  if [[ "$src" == "$dst" ]]; then
+    whiptail --title "$MIRROR_TITLE" --msgbox "Source and target cannot be the same folder." 10 70
+    return 0
+  fi
+
+  if ! whiptail --title "$MIRROR_TITLE" --yesno \
+    "Create mirror?\n\nSource: $src\nTarget: $dst\n\nThis is a bind mount (live view, not copy)." \
+    14 88; then
+    return 0
+  fi
+
+  mkdir -p "$dst"
+
+  if mirror_is_mounted "$dst"; then
+    existing_src="$(mirror_get_mount_source "$dst")"
+    if ! whiptail --title "$MIRROR_TITLE" --yesno \
+      "Target is already mounted:\n$dst <- $existing_src\n\nReplace it with new source?\n$dst <- $src" \
+      14 88; then
+      return 0
+    fi
+    if ! mirror_try_unmount_target "$dst"; then
+      whiptail --title "$MIRROR_TITLE" --msgbox "Failed to unmount existing target:\n$dst" 10 78
+      return 0
+    fi
+  fi
+
+  mount --bind "$src" "$dst"
+
+  if whiptail --title "$MIRROR_TITLE" --yesno \
+    "Mirror mounted successfully.\n\nAdd this mapping to /etc/fstab for autoload at boot?" \
+    12 74; then
+    mirror_add_fstab_bind "$src" "$dst"
+    whiptail --title "$MIRROR_TITLE" --msgbox \
+      "Done.\nMounted now and saved in /etc/fstab:\n$src -> $dst" 12 88
+  else
+    whiptail --title "$MIRROR_TITLE" --msgbox \
+      "Done.\nMounted now (without /etc/fstab entry):\n$src -> $dst" 12 88
+  fi
+  return 0
+}
+
+mirror_unmount_existing_menu() {
+  local rows=() options=() line src dst selected idx state subtype
+  local seen_targets=""
+
+  # Active relevant mounts
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    src="$(echo "$line" | awk -F'|' '{print $1}')"
+    dst="$(echo "$line" | awk -F'|' '{print $2}')"
+    state="$(echo "$line" | awk -F'|' '{print $3}')"
+    rows+=("ACTIVE|$src|$dst|$state")
+    options+=("${#rows[@]}" "[ACTIVE:$state] $dst  <-  $src")
+    seen_targets+=$'\n'"$dst"
+  done < <(mirror_active_relevant_mounts)
+
+  # fstab-only entries (not currently active)
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    src="${line%% *}"
+    dst="${line#* }"
+    if grep -Fxq "$dst" <<<"$seen_targets"; then
+      continue
+    fi
+    rows+=("FSTAB|$src|$dst|BIND")
+    options+=("${#rows[@]}" "[FSTAB]  $dst  <-  $src")
+  done < <(mirror_fstab_bind_mounts)
+
+  if [[ "${#rows[@]}" -eq 0 ]]; then
+    whiptail --title "$MIRROR_TITLE" --msgbox "No active or fstab bind mirrors found." 10 70
+    return 0
+  fi
+
+  selected="$(whiptail --title "$MIRROR_TITLE - Unmount / Remove Mirror" --menu \
+    "Select mirror entry:\n[ACTIVE] bind mounted now, [FSTAB] config only" \
+    24 120 14 \
+    "${options[@]}" \
+    3>&1 1>&2 2>&3)" || return 0
+
+  idx=$((selected - 1))
+  [[ $idx -lt 0 || $idx -ge ${#rows[@]} ]] && {
+    whiptail --title "$MIRROR_TITLE" --msgbox "Internal error: invalid selection." 10 60
+    return 0
+  }
+
+  state="$(echo "${rows[$idx]}" | awk -F'|' '{print $1}')"
+  src="$(echo "${rows[$idx]}" | awk -F'|' '{print $2}')"
+  dst="$(echo "${rows[$idx]}" | awk -F'|' '{print $3}')"
+  subtype="$(echo "${rows[$idx]}" | awk -F'|' '{print $4}')"
+
+  if [[ "$state" == "ACTIVE" ]]; then
+    if ! whiptail --title "$MIRROR_TITLE" --yesno \
+      "Unmount this active mount?\nType: $subtype\n\n$src -> $dst" 12 88; then
+      return 0
+    fi
+
+    if ! mirror_try_unmount_target "$dst"; then
+      whiptail --title "$MIRROR_TITLE" --msgbox \
+        "Failed to unmount:\n$dst\n\nCheck if path is busy and try again." 12 78
+      return 0
+    fi
+
+    if [[ -n "$MIRROR_TRY_UMOUNT_NOTE" ]]; then
+      whiptail --title "$MIRROR_TITLE" --msgbox \
+        "$MIRROR_TRY_UMOUNT_NOTE\n\n$dst" 10 70
+    fi
+  fi
+
+  if [[ "$subtype" == "BIND" ]]; then
+    if whiptail --title "$MIRROR_TITLE" --yesno \
+      "Remove matching /etc/fstab entry too?\n\n$src -> $dst" \
+      12 88; then
+      mirror_remove_fstab_bind_by_target "$dst"
+      whiptail --title "$MIRROR_TITLE" --msgbox "Done.\nEntry removed from /etc/fstab." 10 70
+    else
+      if [[ "$state" == "ACTIVE" ]]; then
+        whiptail --title "$MIRROR_TITLE" --msgbox "Done.\nUnmounted, fstab unchanged." 10 70
+      else
+        whiptail --title "$MIRROR_TITLE" --msgbox "No changes applied." 10 50
+      fi
+    fi
+  else
+    if [[ "$state" == "ACTIVE" ]]; then
+      whiptail --title "$MIRROR_TITLE" --msgbox "Done.\nUnmounted active mount (non-bind)." 10 70
+    else
+      whiptail --title "$MIRROR_TITLE" --msgbox "No changes applied." 10 50
+    fi
+  fi
+  return 0
+}
+
+mirror_list_existing() {
+  local active cfg msg
+  active="$(mirror_active_relevant_mounts || true)"
+  cfg="$(mirror_fstab_bind_mounts || true)"
+
+  msg="Active bind mirrors:\n"
+  if [[ -n "$active" ]]; then
+    msg+="$active"
+  else
+    msg+="(none)"
+  fi
+
+  msg+="\n\nConfigured in /etc/fstab:\n"
+  if [[ -n "$cfg" ]]; then
+    msg+="$cfg"
+  else
+    msg+="(none)"
+  fi
+
+  whiptail --title "$MIRROR_TITLE - Existing Mirrors" --msgbox "$msg" 26 110
+}
+
+mirror_show_help() {
+  local msg
+  msg="$(cat <<EOF
+How this works:
+1) Create mirror (wizard):
+   - choose SOURCE folder (browser like mini-MC)
+   - choose TARGET folder
+   - mount bind SOURCE -> TARGET
+   - optionally add to /etc/fstab for autoload
+
+2) Unmount existing:
+   - list includes ACTIVE mounts and FSTAB-only entries
+   - ACTIVE:BIND  -> unmount + optional fstab cleanup
+   - ACTIVE:MOUNT -> unmount regular mountpoint
+   - FSTAB        -> remove stale bind entry without unmount
+
+Important:
+- Bind mount is a live mirror view, not copying files.
+- Existing files in target become hidden while mount is active.
+- Run this helper on Proxmox host as root.
+EOF
+)"
+  whiptail --title "$MIRROR_TITLE - Help" --msgbox "$msg" 22 90
+}
+
+mirror_main_menu() {
+  local choice
+  while true; do
+    choice="$(whiptail --title "$MIRROR_TITLE" --menu \
+      "Choose action" \
+      18 80 10 \
+      "1" "Create mirror (wizard)" \
+      "2" "Unmount existing mirror" \
+      "3" "List existing mirrors" \
+      "4" "Help" \
+      "0" "Exit" \
+      3>&1 1>&2 2>&3)" || return 0
+
+    case "$choice" in
+      1) mirror_create_wizard ;;
+      2) mirror_unmount_existing_menu ;;
+      3) mirror_list_existing ;;
+      4) mirror_show_help ;;
+      0) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+run_mirror_folder_tool() {
+  [[ -t 0 && -t 1 ]] || die "$EXIT_USAGE" "Mirror folder helper requires an interactive TTY."
+  mirror_require_tools
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    info "DRY-RUN: start built-in mirror folder helper (no changes applied)."
+    return 0
+  fi
+
+  info "Starting built-in mirror folder helper."
+  mirror_main_menu
+}
+
+run_menu_action() {
+  local title="$1"
+  shift
+  local rc=0
+  local message=""
+
+  ("$@") || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    return 0
+  fi
+
+  if [[ "$rc" -eq "$EXIT_CANCELLED" ]]; then
+    message="${title}: cancelled (code=${rc}). Returned to menu."
+    warn "$message"
+  else
+    message="${title}: failed (code=${rc}). Returned to menu."
+    error "$message"
+  fi
+
+  if use_whiptail_ui; then
+    whiptail --title "Action Result" --msgbox "$message" 10 80 || true
+  else
+    printf '\n%s\n' "$message"
+    read -r -p "Press Enter to continue..." _
+  fi
+  return 0
+}
+
 run_menu() {
   local choice
 
@@ -2415,30 +3350,32 @@ run_menu() {
         "1" "Host mount" \
         "2" "LXC attach" \
         "3" "GParted mode" \
-        "4" "Status" \
-        "5" "Remove mounting" \
-        "6" "Advanced menu" \
-        "7" "Help" \
+        "4" "Mirror folder" \
+        "5" "Status" \
+        "6" "Remove mounting" \
+        "7" "Advanced menu" \
+        "8" "Help" \
         "0" "Exit")"
       is_menu_back "$choice" && info "Menu exit." && return 0
       case "$choice" in
-        1) run_host_mount ;;
-        2) run_lxc_attach ;;
-        3) run_disk_editor ;;
-        4) run_status ;;
-        5)
+        1) run_menu_action "Host mount" run_host_mount ;;
+        2) run_menu_action "LXC attach" run_lxc_attach ;;
+        3) run_menu_action "GParted mode" run_disk_editor ;;
+        4) run_menu_action "Mirror folder" run_mirror_folder_tool ;;
+        5) run_menu_action "Status" run_status ;;
+        6)
           choice="$(whiptail_menu_select "Remove mounting" "Choose remove mode" \
             "host" "Remove host mount" \
             "lxc" "Remove LXC bind")"
           is_menu_back "$choice" && continue
           case "$choice" in
-            host) run_rollback_host ;;
-            lxc) run_rollback_lxc ;;
+            host) run_menu_action "Remove host mount" run_rollback_host ;;
+            lxc) run_menu_action "Remove LXC bind" run_rollback_lxc ;;
             *) ;;
           esac
           ;;
-        6) run_advanced_menu ;;
-        7) whiptail_show_text "Help" "$(usage)" ;;
+        7) run_menu_action "Advanced menu" run_advanced_menu ;;
+        8) whiptail_show_text "Help" "$(usage)" ;;
         0) info "Menu exit."; return 0 ;;
         *) warn "Unknown option: $choice" ;;
       esac
@@ -2458,27 +3395,29 @@ Current defaults:
 1) Host mount
 2) LXC attach
 3) GParted mode
-4) Status
-5) Remove mounting
-6) Advanced menu
-7) Help
+4) Mirror folder
+5) Status
+6) Remove mounting
+7) Advanced menu
+8) Help
 0) Exit
 EOF
-    read -r -p "Select an option [0-7]: " choice
+    read -r -p "Select an option [0-8]: " choice
     case "$choice" in
-      1) run_host_mount ;;
-      2) run_lxc_attach ;;
-      3) run_disk_editor ;;
-      4) run_status ;;
-      5)
+      1) run_menu_action "Host mount" run_host_mount ;;
+      2) run_menu_action "LXC attach" run_lxc_attach ;;
+      3) run_menu_action "GParted mode" run_disk_editor ;;
+      4) run_menu_action "Mirror folder" run_mirror_folder_tool ;;
+      5) run_menu_action "Status" run_status ;;
+      6)
         if prompt_yes_no "Remove a host mount? (No = remove LXC bind)" "y"; then
-          run_rollback_host
+          run_menu_action "Remove host mount" run_rollback_host
         else
-          run_rollback_lxc
+          run_menu_action "Remove LXC bind" run_rollback_lxc
         fi
         ;;
-      6) run_advanced_menu ;;
-      7) usage ;;
+      7) run_menu_action "Advanced menu" run_advanced_menu ;;
+      8) usage ;;
       0|q|Q|exit|quit)
         info "Menu exit."
         return 0
@@ -2493,7 +3432,7 @@ parse_args() {
     COMMAND="menu"
   else
     case "$1" in
-      menu|host-mount|lxc-attach|disk-editor|status|remove-mount|remove-lxc|rollback-host|rollback-lxc|help)
+      menu|host-mount|lxc-attach|disk-editor|mirror-folder|status|remove-mount|remove-lxc|rollback-host|rollback-lxc|help)
         COMMAND="$1"
         shift
         ;;
@@ -2609,6 +3548,9 @@ main() {
       ;;
     disk-editor)
       run_disk_editor
+      ;;
+    mirror-folder)
+      run_mirror_folder_tool
       ;;
     status)
       run_status
